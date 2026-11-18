@@ -85,6 +85,94 @@ gift.New().DrawAt(dstImage, fgImage, image.Pt(100, 100), gift.OverOperator)
 ```
 
 
+### REUSABLE EXECUTION PLANS AND WORKSPACES
+
+When the same filter chain is applied repeatedly (for example by a thumbnail
+worker), the regular `Draw` method recomputes every intermediate bounds and
+allocates a new temporary image per filter stage on every call. A compiled
+`Plan` performs this work once, and a `Workspace` recycles the temporary pixel
+buffers across sequential executions.
+
+```go
+g := gift.New(
+    gift.Resize(320, 0, gift.LanczosResampling),
+    gift.CropToSize(300, 300, gift.CenterAnchor),
+    gift.Rotate90(),
+)
+
+// 1. Compile the plan for the source image size. The filter list and the
+//    current options (including the parallelization switch) are snapshotted.
+plan, err := g.Compile(src.Bounds())
+if err != nil {
+    log.Fatal(err)
+}
+
+// 2. Create a workspace with an intermediate pixel budget. The budget counts
+//    only workspace-owned temporary pixels that are alive simultaneously; the
+//    source and destination images are never counted.
+ws, err := gift.NewWorkspace(plan.RequiredPixels())
+if err != nil {
+    log.Fatal(err)
+}
+defer ws.Release() // explicit, deterministic memory release
+
+for _, src := range images {
+    dst := image.NewNRGBA64(plan.OutputBounds())
+    // Validation happens before any destination pixel is written.
+    if err := plan.Draw(ws, dst, src); err != nil {
+        log.Printf("skipping image: %v", err) // the workspace is still reusable
+        continue
+    }
+    // use dst ...
+}
+```
+
+Key properties:
+
+- **Snapshot scope.** A plan captures the filter slice (by reference per
+  filter), a copy of the `Options` value and the input/output bounds of every
+  filter stage. Adding/removing filters on the originating `GIFT` value or
+  toggling `SetParallelization` after compilation does not affect an existing
+  plan. The plan is read-only and safe for concurrent use by any number of
+  goroutines.
+- **Binding to the source size.** A plan is compiled for a specific source
+  width and height. Source images may use a non-zero or even negative origin;
+  only the size is part of the binding. A mismatched source size returns
+  `ErrSourceSizeMismatch`.
+- **Deterministic degenerate cases.** An empty filter chain copies the source
+  exactly like `gift.New().Draw`. A zero-area source produces a zero-area
+  output and performs no writes.
+- **Checked arithmetic.** Overflow in intermediate size or pixel-count
+  computations and non-canonical bounds are reported as `ErrOverflow` /
+  `ErrInvalidBounds` at compilation time, before any execution.
+- **Validation before mutation.** Source size, destination writable range
+  (`ErrDstTooSmall`) and the pixel budget (`ErrBudgetExceeded`) are all checked
+  up front; a failed call leaves every destination pixel untouched.
+- **Workspace lifecycle.** A workspace is reused sequentially: the first
+  execution allocates backing arrays, later executions of the same size reuse
+  them and perform no large pixel allocations. Each workspace serves one
+  execution at a time — concurrent use of the *same* workspace returns
+  `ErrWorkspaceBusy`, while different workspaces may run the same plan
+  concurrently. After a failed execution the workspace keeps no occupancy
+  marker and immediately serves the next image. Buffers larger than the
+  biggest temporary needed by the most recent run are dropped, so a single
+  oversized image cannot pin a large buffer forever. There is no global
+  cache; `Release` frees all retained memory of one workspace.
+- **Budget accounting.** `plan.RequiredPixels()` is the maximum number of
+  simultaneously alive intermediate pixels for `Draw`; `DrawAt` needs
+  `plan.RequiredDrawAtPixels()` when it cannot draw straight into the
+  destination. A budget of zero is valid for chains that need no temps. Use
+  the values returned by these methods to size a workspace exactly, and
+  expect `ErrBudgetExceeded` when the budget is one pixel short.
+- **Placement and clipping.** `plan.DrawAt(ws, dst, src, pt, op)` mirrors
+  `GIFT.DrawAt`, including `CopyOperator`/`OverOperator` semantics. Offsets
+  outside the destination are clipped and never written; a fully clipped
+  placement is a no-op.
+- **Pixel compatibility.** Planned `Draw`/`DrawAt` produce pixel-identical
+  output to the original `GIFT` methods. Filters keep implementing the same
+  `Filter` interface; existing custom filters work without modification.
+
+
 ### SUPPORTED FILTERS
 
 + Transformations
